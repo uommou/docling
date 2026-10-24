@@ -79,6 +79,7 @@ try:  # pragma: no cover - import-time guard
     from pptx import Presentation, presentation
     from pptx.chart.plot import PlotFactory, PlotTypeInspector
     from pptx.enum.action import PP_ACTION
+    from pptx.enum.dml import MSO_FILL
     from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
     from pptx.exc import InvalidXmlError
     from pptx.oxml.ns import qn
@@ -245,6 +246,35 @@ def _is_metafile(image_bytes: bytes) -> bool:
     return image_bytes[:4] == _WMF_PLACEABLE_MAGIC or (
         image_bytes[_EMF_SIGNATURE_OFFSET : _EMF_SIGNATURE_OFFSET + 4] == _EMF_SIGNATURE
     )
+
+
+def _picture_fill_rid(shape: BaseShape) -> Optional[str]:
+    """Return the relationship id of the image a shape is filled with.
+
+    PowerPoint can fill an ordinary shape (``p:sp``) with a picture through
+    ``p:spPr/a:blipFill``. python-pptx reads such a shape as a ``Shape``, not a
+    ``Picture``, so it does not reach the picture handler by type. Only an
+    embedded image can be read; a linked one (``r:link``) points outside the
+    package, so it is skipped with a warning.
+
+    Args:
+        shape: A shape from a slide or a group.
+
+    Returns:
+        The ``r:embed`` id of the picture fill, or None when the shape is not
+        filled with an embedded picture.
+    """
+    if not isinstance(shape, Shape) or shape.fill.type != MSO_FILL.PICTURE:
+        return None
+    blip = shape._element.spPr.eg_fillProperties.blip
+    if blip is None or blip.rEmbed is None:
+        warnings.warn(
+            "Skipping picture fill without an embedded image",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+    return blip.rEmbed
 
 
 def _is_date_format(format_code: str) -> bool:
@@ -1166,11 +1196,22 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _handle_pictures(self, shape, parent_slide, slide_ind, doc, slide_size):
+    def _handle_pictures(
+        self,
+        shape,
+        parent_slide,
+        slide_ind,
+        doc,
+        slide_size,
+        image_rid: Optional[str] = None,
+    ):
         # Read the picture out of the package. A shape that slips past other
         # tools' parsers can still fail here, and there is nothing to record.
+        # A picture fill passes its image_rid; its crop and geometry are ignored.
         try:
-            image = shape.image
+            image = (
+                shape.image if image_rid is None else shape.part.get_image(image_rid)
+            )
             image_bytes = image.blob
             im_dpi, _ = image.dpi
             prov = self._generate_prov(shape, slide_ind, "", slide_size)
@@ -1895,6 +1936,16 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
                     # Handle Pictures, including those inserted into a picture placeholder
                     self._handle_pictures(
                         shape, parent_slide, slide_ind, doc, slide_size
+                    )
+                elif (image_rid := _picture_fill_rid(shape)) is not None:
+                    # Handle shapes filled with a picture
+                    self._handle_pictures(
+                        shape,
+                        parent_slide,
+                        slide_ind,
+                        doc,
+                        slide_size,
+                        image_rid=image_rid,
                     )
                 # If shape doesn't have any text, move on to the next shape
                 if not isinstance(shape, Shape):
